@@ -23,11 +23,17 @@ with st.sidebar:
     )
     st.markdown("---")
     st.markdown(
-        "**Supported files:** PDF, Excel (.xlsx)  \n"
+        "**Supported files:** PDF, Excel (.xlsx), CSV (.csv)  \n"
         "**Max file size:** 10 MB"
     )
 
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
+
+
+# ── Helper: sanitize any string to ASCII-safe ─────────────────────────────────
+def to_ascii_safe(text: str) -> str:
+    """Replace non-ASCII characters with '?' so downstream tools never choke."""
+    return text.encode("ascii", errors="replace").decode("ascii")
 
 
 # ── Text extraction ───────────────────────────────────────────────────────────
@@ -37,15 +43,56 @@ def extract_text_from_pdf(uploaded_file) -> str:
         tmp_path = tmp.name
     try:
         reader = PdfReader(tmp_path)
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
+        pages = []
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            pages.append(to_ascii_safe(text))
+        return "\n".join(pages)
     finally:
         os.unlink(tmp_path)
 
 
 def extract_text_from_excel(uploaded_file) -> str:
     df = pd.read_excel(uploaded_file, engine="openpyxl")
-    rows = [" | ".join(f"{col}: {val}" for col, val in row.items())
-            for _, row in df.iterrows()]
+    rows = []
+    for _, row in df.iterrows():
+        line = " | ".join(
+            f"{to_ascii_safe(str(col))}: {to_ascii_safe(str(val))}"
+            for col, val in row.items()
+        )
+        rows.append(line)
+    return "\n".join(rows)
+
+
+def extract_text_from_csv(uploaded_file) -> str:
+    # quoting=3 (QUOTE_NONE) → don't treat " as special
+    # escapechar="\\" → required when quoting=QUOTE_NONE
+    # on_bad_lines="skip" → drop malformed/unclosed-quote rows silently
+    try:
+        df = pd.read_csv(
+            uploaded_file,
+            encoding="utf-8",
+            quoting=3,
+            escapechar="\\",
+            on_bad_lines="skip",
+        )
+    except UnicodeDecodeError:
+        uploaded_file.seek(0)
+        df = pd.read_csv(
+            uploaded_file,
+            encoding="latin-1",
+            quoting=3,
+            escapechar="\\",
+            on_bad_lines="skip",
+        )
+
+    rows = []
+    for _, row in df.iterrows():
+        line = " | ".join(
+            f"{to_ascii_safe(str(col))}: {to_ascii_safe(str(val))}"
+            for col, val in row.items()
+        )
+        rows.append(line)
     return "\n".join(rows)
 
 
@@ -105,7 +152,10 @@ def answer_question(question: str, index, chunks: list, api_key: str) -> str:
 
 
 # ── Main UI ───────────────────────────────────────────────────────────────────
-uploaded_file = st.file_uploader("Upload a PDF or Excel file", type=["pdf", "xlsx"])
+uploaded_file = st.file_uploader(
+    "Upload a PDF, Excel, or CSV file",
+    type=["pdf", "xlsx", "csv"],
+)
 
 if uploaded_file is not None:
     if len(uploaded_file.getvalue()) > MAX_FILE_SIZE_BYTES:
@@ -125,8 +175,13 @@ if uploaded_file is not None:
             try:
                 if uploaded_file.name.endswith(".pdf"):
                     text = extract_text_from_pdf(uploaded_file)
-                else:
+                elif uploaded_file.name.endswith(".xlsx"):
                     text = extract_text_from_excel(uploaded_file)
+                elif uploaded_file.name.endswith(".csv"):
+                    text = extract_text_from_csv(uploaded_file)
+                else:
+                    st.error("Unsupported file type.")
+                    st.stop()
 
                 if not text.strip():
                     st.error("Could not extract any text from the file.")
