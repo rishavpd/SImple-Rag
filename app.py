@@ -30,10 +30,17 @@ with st.sidebar:
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
 
 
-# ── Helper: sanitize any string to ASCII-safe ─────────────────────────────────
-def to_ascii_safe(text: str) -> str:
-    """Replace non-ASCII characters with '?' so downstream tools never choke."""
-    return text.encode("ascii", errors="replace").decode("ascii")
+# ── Helper: clean text without restricting to ASCII ───────────────────────────
+def clean_text(text: str) -> str:
+    """
+    Remove null bytes and control characters that break tokenizers,
+    but keep all valid UTF-8 including Cyrillic, Chinese, emoji, etc.
+    OpenAI embeddings API accepts full UTF-8 — no need to strip to ASCII.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    # Remove null bytes only — these are the only chars that actually break things
+    return text.replace("\x00", "").strip()
 
 
 # ── Text extraction ───────────────────────────────────────────────────────────
@@ -46,7 +53,7 @@ def extract_text_from_pdf(uploaded_file) -> str:
         pages = []
         for page in reader.pages:
             text = page.extract_text() or ""
-            pages.append(to_ascii_safe(text))
+            pages.append(clean_text(text))
         return "\n".join(pages)
     finally:
         os.unlink(tmp_path)
@@ -54,10 +61,12 @@ def extract_text_from_pdf(uploaded_file) -> str:
 
 def extract_text_from_excel(uploaded_file) -> str:
     df = pd.read_excel(uploaded_file, engine="openpyxl")
+    # Fill NaN so str(val) gives "nan" — replace with empty string
+    df = df.fillna("")
     rows = []
     for _, row in df.iterrows():
         line = " | ".join(
-            f"{to_ascii_safe(str(col))}: {to_ascii_safe(str(val))}"
+            f"{clean_text(str(col))}: {clean_text(str(val))}"
             for col, val in row.items()
         )
         rows.append(line)
@@ -65,31 +74,28 @@ def extract_text_from_excel(uploaded_file) -> str:
 
 
 def extract_text_from_csv(uploaded_file) -> str:
-    # quoting=3 (QUOTE_NONE) → don't treat " as special
-    # escapechar="\\" → required when quoting=QUOTE_NONE
-    # on_bad_lines="skip" → drop malformed/unclosed-quote rows silently
-    try:
-        df = pd.read_csv(
-            uploaded_file,
-            encoding="utf-8",
-            quoting=3,
-            escapechar="\\",
-            on_bad_lines="skip",
-        )
-    except UnicodeDecodeError:
-        uploaded_file.seek(0)
-        df = pd.read_csv(
-            uploaded_file,
-            encoding="latin-1",
-            quoting=3,
-            escapechar="\\",
-            on_bad_lines="skip",
-        )
+    # Try UTF-8 → UTF-8-sig (Mac BOM) → latin-1 (never fails)
+    for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+        try:
+            uploaded_file.seek(0)
+            df = pd.read_csv(
+                uploaded_file,
+                encoding=encoding,
+                quoting=3,            # QUOTE_NONE — ignore quote chars
+                escapechar="\\",      # required with QUOTE_NONE
+                on_bad_lines="skip",  # skip malformed rows silently
+            )
+            break
+        except (UnicodeDecodeError, Exception):
+            continue
+    else:
+        raise ValueError("Could not decode CSV file with any supported encoding.")
 
+    df = df.fillna("")
     rows = []
     for _, row in df.iterrows():
         line = " | ".join(
-            f"{to_ascii_safe(str(col))}: {to_ascii_safe(str(val))}"
+            f"{clean_text(str(col))}: {clean_text(str(val))}"
             for col, val in row.items()
         )
         rows.append(line)
